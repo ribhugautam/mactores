@@ -1,14 +1,30 @@
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { User } from "@/lib/types";
 
 // Mock auth for the exercise — no real identity provider, no database.
 //
-// TODO(candidate): implement token issuance + verification.
-//  - issueTokens(): mint a SHORT-LIVED access token (~60s, so the client's refresh path is
-//    observable) and a longer-lived refresh token. A signed JWT or an opaque token you verify
-//    server-side both work.
-//  - verify the access token in getUserIdFromRequest(), and the refresh token in the refresh route.
-//  - Remember: native EventSource can't send an Authorization header — decide how the SSE route
-//    will authenticate (header via fetch-event-source? short-lived query token? cookie?).
+// Tokens are opaque-to-the-client, HMAC-SHA256 signed strings shaped like a JWT without the
+// header segment: `base64url(payload).base64url(signature)`. A real JWT library would be the
+// production answer; hand-rolling it here keeps the dependency list honest and makes the
+// verification rules (signature, expiry, and *type*) explicit for the review.
+//
+// The signing secret is read from the environment when present so tokens survive a restart in a
+// deployed setting, and falls back to a per-process random secret so `npm run dev` needs zero
+// setup. A restart therefore invalidates outstanding tokens — acceptable, since the job/run store
+// is in-memory and gets wiped by the same restart.
+const SECRET = process.env.ENCODR_TOKEN_SECRET ?? randomBytes(32).toString("hex");
+
+/** Deliberately short so the client's silent-refresh path is exercised during a normal session. */
+export const ACCESS_TOKEN_TTL_SEC = 60;
+export const REFRESH_TOKEN_TTL_SEC = 60 * 60 * 24 * 7;
+
+type TokenType = "access" | "refresh";
+
+interface TokenPayload {
+  sub: string;
+  typ: TokenType;
+  exp: number; // epoch seconds
+}
 
 // The one hard-coded user. Documented in the README.
 const USERS: (User & { password: string })[] = [
@@ -29,24 +45,85 @@ export function findUser(id: string): User | null {
   return safe;
 }
 
-export function issueTokens(_userId: string): { accessToken: string; refreshToken: string } {
-  // TODO(candidate): mint real tokens.
-  throw new Error("Not implemented: issueTokens");
+function sign(body: string): string {
+  return createHmac("sha256", SECRET).update(body).digest("base64url");
 }
 
-export function issueAccessToken(_userId: string): string {
-  // TODO(candidate): mint a new short-lived access token from a valid refresh.
-  throw new Error("Not implemented: issueAccessToken");
+function encode(payload: TokenPayload): string {
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  return `${body}.${sign(body)}`;
 }
 
-/** Return the authenticated userId from the request, or null. */
-export function getUserIdFromRequest(_req: Request): string | null {
-  // TODO(candidate): read + verify the bearer (or query) token and return its subject.
-  return null;
+/**
+ * Verify signature, expiry, and token type. Exported for tests; routes should use the
+ * intent-revealing wrappers below.
+ */
+export function verifyToken(
+  token: string,
+  expectedType: TokenType,
+  now: number = Date.now(),
+): TokenPayload | null {
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+  const [body, signature] = parts;
+  if (!body || !signature) return null;
+
+  const expected = Buffer.from(sign(body));
+  const actual = Buffer.from(signature);
+  // timingSafeEqual throws on a length mismatch, so compare lengths first.
+  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) return null;
+
+  let payload: TokenPayload;
+  try {
+    payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as TokenPayload;
+  } catch {
+    return null;
+  }
+
+  if (typeof payload.sub !== "string" || typeof payload.exp !== "number") return null;
+  // A refresh token must never be usable as an access token (or vice versa).
+  if (payload.typ !== expectedType) return null;
+  if (payload.exp * 1000 <= now) return null;
+
+  return payload;
+}
+
+function mint(userId: string, typ: TokenType, ttlSec: number, now: number): string {
+  return encode({ sub: userId, typ, exp: Math.floor(now / 1000) + ttlSec });
+}
+
+export function issueTokens(
+  userId: string,
+  now: number = Date.now(),
+): { accessToken: string; refreshToken: string } {
+  return {
+    accessToken: mint(userId, "access", ACCESS_TOKEN_TTL_SEC, now),
+    refreshToken: mint(userId, "refresh", REFRESH_TOKEN_TTL_SEC, now),
+  };
+}
+
+export function issueAccessToken(userId: string, now: number = Date.now()): string {
+  return mint(userId, "access", ACCESS_TOKEN_TTL_SEC, now);
+}
+
+/**
+ * Return the authenticated userId from the request, or null.
+ *
+ * Bearer header only — including for the SSE stream, which the client opens with
+ * `@microsoft/fetch-event-source` rather than native `EventSource` precisely so it can set this
+ * header. See the README for why that beats a query-param token.
+ */
+export function getUserIdFromRequest(req: Request): string | null {
+  const header = req.headers.get("authorization");
+  if (!header) return null;
+
+  const [scheme, token] = header.split(" ");
+  if (scheme?.toLowerCase() !== "bearer" || !token) return null;
+
+  return verifyToken(token, "access")?.sub ?? null;
 }
 
 /** Verify a refresh token and return its subject (userId), or null. */
-export function verifyRefreshToken(_token: string): string | null {
-  // TODO(candidate): verify signature + expiry + type.
-  return null;
+export function verifyRefreshToken(token: string): string | null {
+  return verifyToken(token, "refresh")?.sub ?? null;
 }
