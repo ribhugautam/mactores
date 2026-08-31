@@ -12,8 +12,12 @@ export type Stage =
   | "COMPLETED"
   | "FAILED";
 
+/** A stage the run passes *through* — never a resting place. */
+export type ActiveStage = Exclude<Stage, "COMPLETED" | "FAILED">;
+export type TerminalStage = Extract<Stage, "COMPLETED" | "FAILED">;
+
 /** Non-terminal stages, in order. The encode run walks these then lands on a terminal stage. */
-export const ACTIVE_STAGES: Stage[] = [
+export const ACTIVE_STAGES: ActiveStage[] = [
   "QUEUED",
   "DOWNLOADING",
   "PROBING",
@@ -21,11 +25,18 @@ export const ACTIVE_STAGES: Stage[] = [
   "PACKAGING",
 ];
 
-export const TERMINAL_STAGES: Stage[] = ["COMPLETED", "FAILED"];
+export const TERMINAL_STAGES: TerminalStage[] = ["COMPLETED", "FAILED"];
 
-export function isTerminalStage(stage: Stage): boolean {
-  return TERMINAL_STAGES.includes(stage);
+export function isTerminalStage(stage: Stage): stage is TerminalStage {
+  return (TERMINAL_STAGES as Stage[]).includes(stage);
 }
+
+/**
+ * The "magic" source URL whose run always fails partway, so the error path is exercisable.
+ * Lives in the shared contract (not the server store) so the UI can offer it as a demo shortcut
+ * without importing server-only code.
+ */
+export const FAIL_URL = "https://cdn.example.com/videos/corrupt.mp4";
 
 export interface User {
   id: string;
