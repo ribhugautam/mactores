@@ -10,9 +10,22 @@ import {
   type ReactNode,
 } from "react";
 import { useRouter } from "next/navigation";
+import { useQueryClient } from "@tanstack/react-query";
 import type { User } from "@/lib/types";
-import { AUTH_LOGOUT_EVENT } from "@/lib/client/api";
-import { clearTokens, getStoredUser, hydrateTokens } from "@/lib/client/token-store";
+import { api, AUTH_LOGOUT_EVENT } from "@/lib/client/api";
+import {
+  clearTokens,
+  getStoredUser,
+  hydrateTokens,
+  setStoredUser,
+  setTokens,
+} from "@/lib/client/token-store";
+
+interface LoginResponse {
+  accessToken: string;
+  refreshToken: string;
+  user: User;
+}
 
 interface AuthContextValue {
   user: User | null;
@@ -26,6 +39,7 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
 
@@ -38,8 +52,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = useCallback(() => {
     clearTokens();
     setUser(null);
+    // Drop cached jobs/runs too — otherwise the next sign-in briefly renders the previous
+    // session's data before the refetch lands.
+    queryClient.clear();
     router.replace("/signin");
-  }, [router]);
+  }, [queryClient, router]);
 
   // If apiFetch can't recover auth it dispatches AUTH_LOGOUT_EVENT — react globally.
   useEffect(() => {
@@ -48,10 +65,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener(AUTH_LOGOUT_EVENT, handler);
   }, [logout]);
 
-  const login = useCallback(async (_email: string, _password: string) => {
-    // TODO(candidate): POST /api/auth/login, store the returned tokens + user
-    // (see lib/client/token-store.ts), and set the user in state.
-    throw new Error("Not implemented: login");
+  const login = useCallback(async (email: string, password: string) => {
+    const { accessToken, refreshToken, user: signedIn } = await api.post<LoginResponse>(
+      "/api/auth/login",
+      { email, password },
+    );
+
+    // Tokens go into the store before state, so any request fired by the re-render that follows
+    // already has one to attach.
+    setTokens({ accessToken, refreshToken });
+    setStoredUser(signedIn);
+    setUser(signedIn);
   }, []);
 
   const value = useMemo<AuthContextValue>(
