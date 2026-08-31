@@ -1,6 +1,17 @@
-import { error } from "@/lib/server/http";
+import { refreshSchema } from "@/lib/schemas";
+import { findUser, issueAccessToken, verifyRefreshToken } from "@/lib/server/auth";
+import { error, handle, json, parseBody } from "@/lib/server/http";
 
-// TODO(candidate): exchange a valid refresh token (from the body) for a new access token.
-export async function POST(_req: Request) {
-  return error(501, "Not implemented: POST /api/auth/refresh");
+export async function POST(req: Request) {
+  return handle(async () => {
+    const { refreshToken } = await parseBody(req, refreshSchema);
+
+    const userId = verifyRefreshToken(refreshToken);
+    // Verifying the subject still exists matters: a token can outlive the account it names.
+    if (!userId || !findUser(userId)) {
+      return error(401, "Invalid or expired refresh token");
+    }
+
+    return json({ accessToken: issueAccessToken(userId) });
+  });
 }
